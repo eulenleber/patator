@@ -2618,20 +2618,29 @@ class SMTP_Base(TCP_Cache):
     ('helo', 'helo or ehlo command to send after connect [skip]'),
     ('starttls', 'send STARTTLS [0|1]'),
     ('user', 'usernames to test'),
+    ('proxyhost', 'proxy host address'),
+    ('proxyport', 'proxy port'),
+    ('proxytype', 'proxy type [socks4|socks5|http]'),
     )
 
   Response = Response_Base
 
-  def connect(self, host, port, ssl, helo, starttls, timeout):
+  def connect(self, host, port, ssl, helo, starttls, timeout,proxyhost=None, proxyport=None,proxytype=None):
 
     if ssl == '0':
       if not port:
         port = 25
-      fp = SMTP(timeout=int(timeout))
+      if proxyhost is not None:
+        fp = SocksSMTP(host=host,port=int(port),timeout=int(timeout),proxy_addr=proxyhost, proxy_port=int(proxyport), proxy_type=proxytype)
+      else:
+        fp = SMTP(timeout=int(timeout))
     else:
       if not port:
         port = 465
-      fp = SMTP_SSL(timeout=int(timeout))
+      if proxyhost is not None:
+        fp = SocksSMTPSSL(host=host,port=int(port),timeout=int(timeout),proxy_addr=proxyhost, proxy_port=int(proxyport), proxy_type=proxytype)
+      else:
+        fp = SMTP_SSL(timeout=int(timeout))
 
     resp = fp.connect(host, int(port))
 
@@ -2705,13 +2714,88 @@ class SMTP_rcpt(SMTP_Base):
 
     code, mesg = resp
     return self.Response(code, B(mesg), timing)
+import socks
+class SocksSMTP(SMTP):
+    """
+    IMAP service trough SOCKS proxy. PySocks module required.
+    """
 
+    PROXY_TYPES = {"socks4": socks.PROXY_TYPE_SOCKS4,
+                   "socks5": socks.PROXY_TYPE_SOCKS5,
+                   "http": socks.PROXY_TYPE_HTTP}
+
+    def __init__(self, host='', port=25, proxy_addr=None, proxy_port=None,
+                 rdns=True, username=None, password=None, proxy_type="socks5",**kwargs):
+
+        self.proxy_addr = proxy_addr
+        self.proxy_port = proxy_port
+        self.rdns = rdns
+        self.username = username
+        self.password = password
+        self.proxy_type = SocksSMTP.PROXY_TYPES[proxy_type.lower()]
+        if 'local_hostname' not in kwargs:
+            kwargs['local_hostname']='mail.mx.com'
+
+        SMTP.__init__(self, host, port,**kwargs)
+
+    def _create_socket(self):
+        return create_connection((self.host, self.port), proxy_type=self.proxy_type, proxy_addr=self.proxy_addr,
+                                 proxy_port=self.proxy_port, proxy_rdns=self.rdns, proxy_username=self.username,
+                                 proxy_password=self.password)
+    def _get_socket(self, host, port, timeout):
+        if self.debuglevel > 0:
+            self._print_debug('connect: to', (host, port), self.source_address)
+        return create_connection((host, port), timeout,
+                                        self.source_address,proxy_type=self.proxy_type, proxy_addr=self.proxy_addr,
+                                 proxy_port=self.proxy_port, proxy_rdns=self.rdns, proxy_username=self.username,
+                                 proxy_password=self.password)
+
+class SocksSMTPSSL(SocksSMTP):
+
+    def __init__(self, host='', port=587, keyfile=None, certfile=None, ssl_context=None, proxy_addr=None,
+                 proxy_port=None, rdns=True, username=None, password=None, proxy_type="socks5",**kwargs):
+
+        if ssl_context is not None and keyfile is not None:
+                raise ValueError("ssl_context and keyfile arguments are mutually "
+                                 "exclusive")
+        if ssl_context is not None and certfile is not None:
+            raise ValueError("ssl_context and certfile arguments are mutually "
+                             "exclusive")
+
+        self.keyfile = keyfile
+        self.certfile = certfile
+        if ssl_context is None:
+            ssl_context = ssl._create_stdlib_context(certfile=certfile,
+                                                     keyfile=keyfile)
+        self.ssl_context = ssl_context
+
+        SocksSMTP.__init__(self, host, port, proxy_addr=proxy_addr, proxy_port=proxy_port,
+                            rdns=rdns, username=username, password=password, proxy_type=proxy_type,**kwargs)
+
+    def _create_socket(self):
+        sock = SocksSMTP._create_socket(self)
+        server_hostname = self.host if ssl.HAS_SNI else None
+        return self.ssl_context.wrap_socket(sock, server_hostname=server_hostname)
+
+    def _get_socket(self, host, port, timeout):
+        if self.debuglevel > 0:
+            self._print_debug('connect:', (host, port))
+        new_socket = create_connection((host, port), timeout,self.source_address,proxy_type=self.proxy_type, proxy_addr=self.proxy_addr,
+                                 proxy_port=self.proxy_port, proxy_rdns=self.rdns, proxy_username=self.username,
+                                 proxy_password=self.password)
+        server_hostname = host if ssl.HAS_SNI else None
+
+        new_socket = self.ssl_context.wrap_socket(new_socket, server_hostname=server_hostname)
+        return new_socket
+
+    def open(self, host='', port=587):
+        SocksSMTP.open(self, host, port)
 
 class SMTP_login(SMTP_Base):
   '''Brute-force SMTP'''
 
   usage_hints = (
-    '''%prog host=10.0.0.1 user=f.bar@dom.com password=FILE0 0=passwords.txt [helo='ehlo its.me.com']'''
+    '''%prog host=10.0.0.1 user=f.bar@dom.com password=FILE0 0=passwords.txt [helo='ehlo its.me.com'] proxyhost=127.0.0.1 proxyport=16379 proxytype=socks5'''
     ''' -x ignore:fgrep='Authentication failed' -x ignore,reset,retry:code=421''',
     )
 
@@ -2720,10 +2804,10 @@ class SMTP_login(SMTP_Base):
     ('password', 'passwords to test'),
     )
 
-  def execute(self, host, port='', ssl='0', helo='', starttls='0', user=None, password=None, timeout='10', persistent='1'):
+  def execute(self, host, port='', ssl='0', helo='', starttls='0', user=None, password=None, timeout='10', persistent='1',proxyhost=None, proxyport=None, proxytype=None):
 
     with Timing() as timing:
-      fp, resp = self.bind(host, port, ssl, helo, starttls, timeout=timeout)
+      fp, resp = self.bind(host, port, ssl, helo, starttls, timeout=timeout,proxyhost=proxyhost, proxyport=int(proxyport), proxytype=proxytype)
 
     try:
       if user is not None and password is not None:
@@ -3119,13 +3203,78 @@ class POP_passd:
 # }}}
 
 # IMAP {{{
+import ssl
+from socks import create_connection
+from socks import PROXY_TYPE_SOCKS4
+from socks import PROXY_TYPE_SOCKS5
+from socks import PROXY_TYPE_HTTP
+
+from imaplib import IMAP4
+from imaplib import IMAP4_PORT
+from imaplib import IMAP4_SSL_PORT
 from imaplib import IMAP4, IMAP4_SSL
+class SocksIMAP4(IMAP4):
+    """
+    IMAP service trough SOCKS proxy. PySocks module required.
+    """
+
+    PROXY_TYPES = {"socks4": PROXY_TYPE_SOCKS4,
+                   "socks5": PROXY_TYPE_SOCKS5,
+                   "http": PROXY_TYPE_HTTP}
+
+    def __init__(self, host, port=IMAP4_PORT, proxy_addr=None, proxy_port=None,
+                 rdns=True, username=None, password=None, proxy_type="socks5"):
+
+        self.proxy_addr = proxy_addr
+        self.proxy_port = proxy_port
+        self.rdns = rdns
+        self.username = username
+        self.password = password
+        self.proxy_type = SocksIMAP4.PROXY_TYPES[proxy_type.lower()]
+
+        IMAP4.__init__(self, host, port)
+
+    def _create_socket(self):
+        return create_connection((self.host, self.port), proxy_type=self.proxy_type, proxy_addr=self.proxy_addr,
+                                 proxy_port=self.proxy_port, proxy_rdns=self.rdns, proxy_username=self.username,
+                                 proxy_password=self.password)
+
+
+class SocksIMAP4SSL(SocksIMAP4):
+
+    def __init__(self, host='', port=IMAP4_SSL_PORT, keyfile=None, certfile=None, ssl_context=None, proxy_addr=None,
+                 proxy_port=None, rdns=True, username=None, password=None, proxy_type="socks5"):
+
+        if ssl_context is not None and keyfile is not None:
+                raise ValueError("ssl_context and keyfile arguments are mutually "
+                                 "exclusive")
+        if ssl_context is not None and certfile is not None:
+            raise ValueError("ssl_context and certfile arguments are mutually "
+                             "exclusive")
+
+        self.keyfile = keyfile
+        self.certfile = certfile
+        if ssl_context is None:
+            ssl_context = ssl._create_stdlib_context(certfile=certfile,
+                                                     keyfile=keyfile)
+        self.ssl_context = ssl_context
+
+        SocksIMAP4.__init__(self, host, port, proxy_addr=proxy_addr, proxy_port=proxy_port,
+                            rdns=rdns, username=username, password=password, proxy_type=proxy_type)
+
+    def _create_socket(self):
+        sock = SocksIMAP4._create_socket(self)
+        server_hostname = self.host if ssl.HAS_SNI else None
+        return self.ssl_context.wrap_socket(sock, server_hostname=server_hostname)
+
+    def open(self, host='', port=IMAP4_PORT):
+        SocksIMAP4.open(self, host, port)
 
 class IMAP_login:
   '''Brute-force IMAP4'''
 
   usage_hints = (
-    '''%prog host=10.0.0.1 user=FILE0 password=FILE1 0=logins.txt 1=passwords.txt''',
+    '''%prog host=10.0.0.1 user=FILE0 password=FILE1 proxyhost=127.0.0.1 proxyport=16379 proxytype=socks5 0=logins.txt 1=passwords.txt''',
     )
 
   available_options = (
@@ -3134,23 +3283,42 @@ class IMAP_login:
     ('user', 'usernames to test'),
     ('password', 'passwords to test'),
     ('ssl', 'use SSL [0|1]'),
+    ('proxyhost', 'proxy host address'),
+    ('proxyport', 'proxy port'),
+    ('proxytype', 'proxy type [socks4|socks5|http]'),
+
     )
   available_actions = ()
 
   Response = Response_Base
 
-  def execute(self, host, port='', ssl='0', user=None, password=None):
+  def execute(self, host, port='', ssl='0', user=None, password=None,proxyhost=None, proxyport=None,proxytype=None):
+    proxy=False
     if ssl == '0':
       if not port:
         port = 143
-      klass = IMAP4
+      if proxyhost is not None:
+        klass = SocksIMAP4
+        proxy=True
+      else:
+        klass = IMAP4
     else:
       if not port:
         port = 993
-      klass = IMAP4_SSL
+      if proxyhost is not None:
+        klass = SocksIMAP4SSL
+        proxy=True
+      else:
+        klass = IMAP4_SSL
+
+
 
     with Timing() as timing:
-      fp = klass(host, port)
+      if proxy:
+        print(f'proxyied: {klass}(host={host}, port={port},proxy_addr={proxyhost}, proxy_port={proxyport}, proxy_type={proxytype})')
+        fp = klass(host=host, port=int(port),proxy_addr=proxyhost, proxy_port=int(proxyport), proxy_type=proxytype)
+      else:
+        fp = klass(host, port)
 
     code, resp = 0, fp.welcome
 
@@ -3158,7 +3326,7 @@ class IMAP_login:
       if user is not None and password is not None:
         with Timing() as timing:
           r = fp.login(user, password)
-        resp = ', '.join(r[1])
+        resp = ', '.join(map(str,r[1]))
 
       # doesn't it need to self.reset() to test more creds?
 
